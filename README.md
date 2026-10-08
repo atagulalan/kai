@@ -120,9 +120,16 @@ Optional body…
 
 Ids: `{prefix}{U|A}{###}` — `U` from `--author user`, `A` from `--author ai`, numeric suffix incremental per letter.
 
-## Cursor skill
+## Agent skill (Codex / Claude / Cursor)
 
-Copy [`.cursor/skills/kai/SKILL.md`](.cursor/skills/kai/SKILL.md) into a project’s `.cursor/skills/kai/` so agents use `./kai` only and never index `.kai/`.
+Canonical skill: [`.agents/skills/kai/SKILL.md`](.agents/skills/kai/SKILL.md)
+
+Also mirrored for:
+
+- Claude Code → `.claude/skills/kai/`
+- Cursor → `.cursor/skills/kai/`
+
+`npx kaijou` installs all three into the target project automatically.
 
 ## kaitui (optional)
 
@@ -141,4 +148,4 @@ make test
 
 ## License
 
-Same as the parent project license unless this repo ships its own `LICENSE`.
+MIT (see repository `LICENSE` if present).
