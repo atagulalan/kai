@@ -135,7 +135,8 @@ Or place a built binary next to `./kai` and run `./kai tui`. See [kaitui](https:
 ## Tests
 
 ```bash
-./tests/kai_test.sh
+make test
+# or: ./tests/kai_test.sh
 ```
 
 ## License
