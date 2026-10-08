@@ -1,0 +1,958 @@
+#!/usr/bin/env bash
+# kai — markdown kanban board manager (.kai/)
+set -euo pipefail
+
+# Board data: <repo>/.kai/{config,items,images,BOARD.md}
+# CLI: ./kai at repo root (or monorepo via KAI_REPO_ROOT). Legacy: script inside .kai/
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${KAI_REPO_ROOT:-}" ]]; then
+  REPO_ROOT="$(cd "$KAI_REPO_ROOT" && pwd)"
+  KAI_DIR="${REPO_ROOT}/.kai"
+elif [[ "$(basename "$SCRIPT_DIR")" == ".kai" ]]; then
+  KAI_DIR="$SCRIPT_DIR"
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+else
+  # Package layout (…/kai/kai): prefer parent repo if it already has .kai/
+  parent="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  if [[ -d "${parent}/.kai" || -f "${parent}/.kai/config" ]]; then
+    REPO_ROOT="$parent"
+  else
+    REPO_ROOT="$SCRIPT_DIR"
+  fi
+  KAI_DIR="${REPO_ROOT}/.kai"
+fi
+CONFIG="${KAI_DIR}/config"
+ITEMS_DIR="${KAI_DIR}/items"
+IMAGES_DIR="${KAI_DIR}/images"
+BOARD_FILE="${KAI_DIR}/BOARD.md"
+
+die() { echo "error: $*" >&2; exit 1; }
+usage() {
+  cat <<'EOF'
+Usage: ./kai <command> [options]
+
+Commands:
+  init [prefix]              Create .kai skeleton (default prefix: Kai)
+  list [--all] [--column C] [--details]
+                             Show active columns (default: top N per column)
+  ready [--all] [--details]  Items whose depends are all done (parallel work)
+  show <id>                  Show full item (+ ready/blocked note)
+  add --author user|ai --title "..." [--column todo] [--priority N]
+      [--body "..."] [--depends id1,id2]
+                             Create item with next incremental id
+  depend <id> <dep-id>       Add dependency (id depends on dep-id)
+  undepend <id> <dep-id>     Remove dependency
+  move <id> <column>         Move item to column
+  priority <id> <n>          Set priority
+  done <id>                  Move item to done
+  image <path>               Copy image into .kai/images/, print relative path
+  board                      Regenerate and print BOARD.md
+  workflow                   Show columns and allowed transitions
+  tui                        Launch kaitui (Go Bubble Tea UI)
+  help                       Show this help
+
+Config:
+  columns / workflow / start_column / done_column — board shape + legal moves
+  deps_mode=soft|hard (default soft):
+    soft — deps only annotate; hard — blocked items may only move to start_column
+  workflow format: from>to1,to2|from2>to3   (empty after > = no exits)
+  agent=none|name — fixed TUI agent (not changeable at runtime); none hides input
+  agent.<name>=… — shell template with {prompt} and optional {id}
+EOF
+}
+
+# --- config ---
+
+load_config() {
+  [[ -f "$CONFIG" ]] || die "missing $CONFIG — run: ./kai init"
+  PREFIX=""
+  COLUMNS=""
+  WORKFLOW_RAW=""
+  START_COLUMN=""
+  DONE_COLUMN=""
+  DEFAULT_LIMIT=5
+  DEPS_MODE="soft"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$key" in
+      prefix) PREFIX="$val" ;;
+      columns) COLUMNS="$val" ;;
+      workflow) WORKFLOW_RAW="$val" ;;
+      start_column) START_COLUMN="$val" ;;
+      done_column) DONE_COLUMN="$val" ;;
+      default_limit) DEFAULT_LIMIT="$val" ;;
+      deps_mode) DEPS_MODE="$val" ;;
+    esac
+  done < "$CONFIG"
+  [[ -n "$PREFIX" ]] || die "config: prefix is required"
+  [[ -n "$COLUMNS" ]] || die "config: columns is required"
+  case "$DEPS_MODE" in
+    soft|hard) ;;
+    *) die "config: deps_mode must be soft or hard (got: $DEPS_MODE)" ;;
+  esac
+  IFS=',' read -ra COLUMN_ARR <<< "$COLUMNS"
+  [[ ${#COLUMN_ARR[@]} -ge 1 ]] || die "config: columns must list at least one column"
+
+  if [[ -z "$START_COLUMN" ]]; then
+    START_COLUMN="${COLUMN_ARR[0]}"
+  fi
+  if [[ -z "$DONE_COLUMN" ]]; then
+    DONE_COLUMN="${COLUMN_ARR[$((${#COLUMN_ARR[@]} - 1))]}"
+  fi
+  valid_column "$START_COLUMN" || die "config: start_column not in columns: $START_COLUMN"
+  valid_column "$DONE_COLUMN" || die "config: done_column not in columns: $DONE_COLUMN"
+
+  # Default classic workflow if omitted (backward compatible for old configs).
+  if [[ -z "$WORKFLOW_RAW" ]]; then
+    if [[ "$COLUMNS" == "todo,doing,done" ]]; then
+      WORKFLOW_RAW="todo>doing|doing>todo,done|done>todo"
+    else
+      # linear forward only: c0>c1|c1>c2|...
+      local i wf="" 
+      for ((i=0; i<${#COLUMN_ARR[@]}-1; i++)); do
+        [[ -n "$wf" ]] && wf+="|"
+        wf+="${COLUMN_ARR[i]}>${COLUMN_ARR[i+1]}"
+      done
+      WORKFLOW_RAW="$wf"
+    fi
+  fi
+
+  declare -gA WORKFLOW=()
+  local rule from tos t
+  IFS='|' read -ra _wf_rules <<< "$WORKFLOW_RAW"
+  for rule in "${_wf_rules[@]}"; do
+    [[ -z "$rule" ]] && continue
+    [[ "$rule" == *">"* ]] || die "config: workflow rule missing '>': $rule"
+    from="${rule%%>*}"
+    tos="${rule#*>}"
+    valid_column "$from" || die "config: workflow from-column unknown: $from"
+    if [[ -n "$tos" ]]; then
+      IFS=',' read -ra _tos <<< "$tos"
+      for t in "${_tos[@]}"; do
+        t="${t#"${t%%[![:space:]]*}"}"
+        t="${t%"${t##*[![:space:]]}"}"
+        [[ -z "$t" ]] && continue
+        valid_column "$t" || die "config: workflow to-column unknown: $t"
+      done
+    fi
+    WORKFLOW["$from"]="$tos"
+  done
+}
+
+valid_column() {
+  local c="$1"
+  local col
+  for col in "${COLUMN_ARR[@]}"; do
+    [[ "$col" == "$c" ]] && return 0
+  done
+  return 1
+}
+
+# Allowed next columns for `from`, space-separated (for messages).
+workflow_targets() {
+  local from="$1"
+  local tos="${WORKFLOW[$from]-}"
+  if [[ -z "$tos" ]]; then
+    echo "(none)"
+    return
+  fi
+  echo "$tos" | tr ',' ' '
+}
+
+# Exit 0 if from→to is allowed (same column = no-op ok).
+workflow_allows() {
+  local from="$1" to="$2"
+  [[ "$from" == "$to" ]] && return 0
+  local tos t
+  tos="${WORKFLOW[$from]-}"
+  [[ -z "$tos" ]] && return 1
+  IFS=',' read -ra _allow <<< "$tos"
+  for t in "${_allow[@]}"; do
+    t="${t#"${t%%[![:space:]]*}"}"
+    t="${t%"${t##*[![:space:]]}"}"
+    [[ "$t" == "$to" ]] && return 0
+  done
+  return 1
+}
+
+assert_workflow() {
+  local from="$1" to="$2"
+  [[ "$from" == "$to" ]] && return 0
+  if workflow_allows "$from" "$to"; then
+    return 0
+  fi
+  die "workflow: cannot ${from} → ${to} (allowed: $(workflow_targets "$from"))"
+}
+
+author_letter() {
+  case "$1" in
+    user) echo U ;;
+    ai) echo A ;;
+    *) die "author must be user or ai" ;;
+  esac
+}
+
+# --- frontmatter helpers ---
+
+fm_get() {
+  local file="$1" key="$2"
+  awk -v key="$key" '
+    BEGIN { in_fm=0 }
+    /^---[[:space:]]*$/ {
+      if (in_fm==0) { in_fm=1; next }
+      else exit
+    }
+    in_fm==1 {
+      if ($0 ~ ("^" key ":[[:space:]]*")) {
+        sub("^" key ":[[:space:]]*", "")
+        print
+        exit
+      }
+    }
+  ' "$file"
+}
+
+fm_set() {
+  local file="$1" key="$2" value="$3"
+  local tmp mode
+  mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%OLp' "$file")"
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { in_fm=0; done=0 }
+    /^---[[:space:]]*$/ {
+      if (in_fm==0) { in_fm=1; print; next }
+      if (in_fm==1 && done==0) {
+        print key ": " value
+        done=1
+      }
+      in_fm=2
+      print
+      next
+    }
+    in_fm==1 {
+      if ($0 ~ ("^" key ":[[:space:]]*")) {
+        print key ": " value
+        done=1
+        next
+      }
+      print
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  chmod "$mode" "$tmp"
+  mv "$tmp" "$file"
+}
+
+fm_delete() {
+  local file="$1" key="$2"
+  local tmp mode
+  mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%OLp' "$file")"
+  tmp="$(mktemp)"
+  awk -v key="$key" '
+    BEGIN { in_fm=0 }
+    /^---[[:space:]]*$/ {
+      if (in_fm==0) { in_fm=1; print; next }
+      in_fm=2
+      print
+      next
+    }
+    in_fm==1 {
+      if ($0 ~ ("^" key ":[[:space:]]*")) next
+      print
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  chmod "$mode" "$tmp"
+  mv "$tmp" "$file"
+}
+
+fm_body() {
+  local file="$1"
+  awk '
+    BEGIN { n=0 }
+    /^---[[:space:]]*$/ { n++; next }
+    n>=2 { print }
+  ' "$file"
+}
+
+item_path() {
+  echo "${ITEMS_DIR}/$1.md"
+}
+
+require_item() {
+  local id="$1"
+  local path
+  path="$(item_path "$id")"
+  [[ -f "$path" ]] || die "item not found: $id"
+  echo "$path"
+}
+
+item_exists() {
+  [[ -f "$(item_path "$1")" ]]
+}
+
+next_id() {
+  local letter="$1"
+  local max=0
+  local f base num
+  shopt -s nullglob
+  for f in "${ITEMS_DIR}/${PREFIX}${letter}"*.md; do
+    base="$(basename "$f" .md)"
+    num="${base#${PREFIX}${letter}}"
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+      num=$((10#$num))
+      (( num > max )) && max=$num
+    fi
+  done
+  shopt -u nullglob
+  local next=$((max + 1))
+  printf '%s%s%03d' "$PREFIX" "$letter" "$next"
+}
+
+# --- depends / ready ---
+
+# Print dependency ids one per line (trimmed, non-empty).
+depends_of() {
+  local id="$1"
+  local path raw
+  path="$(item_path "$id")"
+  [[ -f "$path" ]] || return 0
+  raw="$(fm_get "$path" depends)"
+  [[ -z "$raw" ]] && return 0
+  local part
+  IFS=',' read -ra _deps <<< "$raw"
+  for part in "${_deps[@]}"; do
+    part="${part#"${part%%[![:space:]]*}"}"
+    part="${part%"${part##*[![:space:]]}"}"
+    [[ -n "$part" ]] && printf '%s\n' "$part"
+  done
+}
+
+item_column() {
+  local path
+  path="$(item_path "$1")"
+  [[ -f "$path" ]] || { echo ""; return; }
+  fm_get "$path" column
+}
+
+# Unfinished dependency ids (column != done), one per line.
+blocking_deps() {
+  local id="$1" dep col
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    if ! item_exists "$dep"; then
+      printf '%s\n' "$dep"
+      continue
+    fi
+    col="$(item_column "$dep")"
+    [[ "$col" == "$DONE_COLUMN" ]] || printf '%s\n' "$dep"
+  done < <(depends_of "$id")
+}
+
+# Ready: not in done_column, and no blocking deps. Return 0 if ready.
+is_ready() {
+  local id="$1"
+  local col
+  col="$(item_column "$id")"
+  [[ "$col" == "$DONE_COLUMN" ]] && return 1
+  local blockers
+  blockers="$(blocking_deps "$id")"
+  [[ -z "$blockers" ]]
+}
+
+# Annotation for display: [ready], [blocked: A,B], or empty if done.
+status_note() {
+  local id="$1"
+  local col
+  col="$(item_column "$id")"
+  [[ "$col" == "$DONE_COLUMN" ]] && { echo ""; return; }
+  local blockers joined
+  blockers="$(blocking_deps "$id" | paste -sd',' -)"
+  if [[ -n "$blockers" ]]; then
+    echo "[blocked: ${blockers}]"
+  else
+    echo "[ready]"
+  fi
+}
+
+# True (exit 0) if adding edge id→dep would create a cycle.
+would_cycle() {
+  local id="$1" dep="$2"
+  [[ "$id" == "$dep" ]] && return 0
+  local -a queue=("$dep")
+  local -A seen=()
+  local cur next
+  while ((${#queue[@]})); do
+    cur="${queue[0]}"
+    queue=("${queue[@]:1}")
+    [[ -n "${seen[$cur]:-}" ]] && continue
+    seen[$cur]=1
+    [[ "$cur" == "$id" ]] && return 0
+    while IFS= read -r next; do
+      [[ -n "$next" ]] && queue+=("$next")
+    done < <(depends_of "$cur")
+  done
+  return 1
+}
+
+validate_depends_list() {
+  local self_id="$1"
+  shift
+  local dep
+  for dep in "$@"; do
+    [[ -n "$dep" ]] || continue
+    item_exists "$dep" || die "depends on missing item: $dep"
+    if would_cycle "$self_id" "$dep"; then
+      die "dependency cycle: ${self_id} → ${dep}"
+    fi
+  done
+}
+
+# Join deps for frontmatter (unique, stable order of args).
+join_depends() {
+  local -A seen=()
+  local out=() d
+  for d in "$@"; do
+    [[ -z "$d" ]] && continue
+    [[ -n "${seen[$d]:-}" ]] && continue
+    seen[$d]=1
+    out+=("$d")
+  done
+  local IFS=','
+  echo "${out[*]}"
+}
+
+assert_hard_progress() {
+  local id="$1" target="$2"
+  [[ "$DEPS_MODE" == "hard" ]] || return 0
+  # Demote to start_column always allowed while blocked.
+  [[ "$target" == "$START_COLUMN" ]] && return 0
+  if is_ready "$id"; then
+    return 0
+  fi
+  local blockers
+  blockers="$(blocking_deps "$id" | paste -sd',' -)"
+  die "blocked (${DEPS_MODE}): ${id} waits on ${blockers} — cannot move to ${target}"
+}
+
+collect_column() {
+  local col="$1"
+  local f id c pri title
+  shopt -s nullglob
+  for f in "${ITEMS_DIR}"/*.md; do
+    [[ "$(basename "$f")" == ".gitkeep" ]] && continue
+    c="$(fm_get "$f" column)"
+    [[ "$c" == "$col" ]] || continue
+    id="$(fm_get "$f" id)"
+    pri="$(fm_get "$f" priority)"
+    title="$(fm_get "$f" title)"
+    [[ -z "$pri" ]] && pri=0
+    printf '%s|%s|%s|%s\n' "$pri" "$id" "$title" "$f"
+  done
+  shopt -u nullglob
+}
+
+# All non-done items: priority|id|title|path
+collect_open() {
+  local f id c pri title
+  shopt -s nullglob
+  for f in "${ITEMS_DIR}"/*.md; do
+    [[ "$(basename "$f")" == ".gitkeep" ]] && continue
+    c="$(fm_get "$f" column)"
+    [[ "$c" == "$DONE_COLUMN" ]] && continue
+    id="$(fm_get "$f" id)"
+    pri="$(fm_get "$f" priority)"
+    title="$(fm_get "$f" title)"
+    [[ -z "$pri" ]] && pri=0
+    printf '%s|%s|%s|%s\n' "$pri" "$id" "$title" "$f"
+  done
+  shopt -u nullglob
+}
+
+sort_items() {
+  sort -t'|' -k1,1nr -k2,2
+}
+
+format_item_line() {
+  local id="$1" pri="$2" title="$3"
+  local note
+  note="$(status_note "$id")"
+  if [[ -n "$note" ]]; then
+    echo "- [${id}] p${pri} ${title} ${note}"
+  else
+    echo "- [${id}] p${pri} ${title}"
+  fi
+}
+
+# --- commands ---
+
+cmd_init() {
+  local prefix="${1:-Kai}"
+  if [[ -d "$KAI_DIR" && -f "$CONFIG" ]]; then
+    echo "already initialized: $KAI_DIR"
+    return 0
+  fi
+  mkdir -p "$ITEMS_DIR" "$IMAGES_DIR"
+  cat > "$CONFIG" <<EOF
+prefix=${prefix}
+columns=todo,doing,done
+workflow=todo>doing|doing>todo,done|done>todo
+start_column=todo
+done_column=done
+default_limit=5
+deps_mode=soft
+agent=codex
+agent.codex=codex exec -m gpt-5.6-luna -c model_reasoning_effort="low" -s workspace-write {prompt}
+agent.cursor=cursor agent -p --force {prompt}
+agent.claude=claude -p {prompt}
+EOF
+  touch "${ITEMS_DIR}/.gitkeep" "${IMAGES_DIR}/.gitkeep"
+  cat > "$BOARD_FILE" <<'EOF'
+# Kanban Board
+
+_Empty board. Use \`./kai add\` to create items._
+EOF
+  echo "initialized .kai (prefix=${prefix})"
+}
+
+cmd_board_write() {
+  load_config
+  {
+    echo "# Kanban Board"
+    echo ""
+    echo "_Generated by \`./kai board\`. Do not edit by hand — regenerate after changes._"
+    echo ""
+    local col line count
+    for col in "${COLUMN_ARR[@]}"; do
+      echo "## ${col}"
+      echo ""
+      count=0
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local pri id title rest rest2 note
+        pri="${line%%|*}"
+        rest="${line#*|}"
+        id="${rest%%|*}"
+        rest2="${rest#*|}"
+        title="${rest2%%|*}"
+        note="$(status_note "$id")"
+        if [[ -n "$note" ]]; then
+          echo "- \`${id}\` (p${pri}) ${title} ${note}"
+        else
+          echo "- \`${id}\` (p${pri}) ${title}"
+        fi
+        count=$((count + 1))
+      done < <(collect_column "$col" | sort_items)
+      if (( count == 0 )); then
+        echo "_empty_"
+      fi
+      echo ""
+    done
+  } > "$BOARD_FILE"
+}
+
+cmd_board() {
+  cmd_board_write
+  cat "$BOARD_FILE"
+}
+
+cmd_list() {
+  load_config
+  local show_all=0 details=0 filter_col=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) show_all=1; shift ;;
+      --details) details=1; shift ;;
+      --column)
+        [[ $# -ge 2 ]] || die "--column needs a value"
+        filter_col="$2"
+        shift 2
+        ;;
+      *) die "unknown list option: $1" ;;
+    esac
+  done
+
+  if [[ -n "$filter_col" ]]; then
+    valid_column "$filter_col" || die "unknown column: $filter_col (active: $COLUMNS)"
+  fi
+
+  local cols=()
+  if [[ -n "$filter_col" ]]; then
+    cols=("$filter_col")
+  else
+    cols=("${COLUMN_ARR[@]}")
+  fi
+
+  local col line shown limit body path
+  for col in "${cols[@]}"; do
+    echo "## ${col}"
+    shown=0
+    limit="$DEFAULT_LIMIT"
+    (( show_all )) && limit=999999
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      (( shown >= limit )) && break
+      local pri id title rest rest2
+      pri="${line%%|*}"
+      rest="${line#*|}"
+      id="${rest%%|*}"
+      rest2="${rest#*|}"
+      title="${rest2%%|*}"
+      path="${rest2#*|}"
+      format_item_line "$id" "$pri" "$title"
+      if (( details )); then
+        local deps_raw
+        deps_raw="$(fm_get "$path" depends)"
+        [[ -n "$deps_raw" ]] && echo "  depends: ${deps_raw}"
+        body="$(fm_body "$path")"
+        if [[ -n "${body// }" ]]; then
+          while IFS= read -r bline || [[ -n "$bline" ]]; do
+            echo "  ${bline}"
+          done <<< "$body"
+        fi
+        echo ""
+      fi
+      shown=$((shown + 1))
+    done < <(collect_column "$col" | sort_items)
+
+    local total
+    total="$(collect_column "$col" | wc -l | tr -d ' ')"
+    if (( shown == 0 )); then
+      echo "  (empty)"
+    elif (( !show_all && total > shown )); then
+      echo "  … and $((total - shown)) more (use --all)"
+    fi
+    echo ""
+  done
+}
+
+cmd_ready() {
+  load_config
+  local show_all=0 details=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) show_all=1; shift ;;
+      --details) details=1; shift ;;
+      *) die "unknown ready option: $1" ;;
+    esac
+  done
+
+  echo "## ready (parallel)"
+  local line shown limit=0 total=0
+  shown=0
+  limit="$DEFAULT_LIMIT"
+  (( show_all )) && limit=999999
+
+  local ready_lines=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local pri id title path rest rest2
+    pri="${line%%|*}"
+    rest="${line#*|}"
+    id="${rest%%|*}"
+    rest2="${rest#*|}"
+    title="${rest2%%|*}"
+    path="${rest2#*|}"
+    if is_ready "$id"; then
+      ready_lines+="${line}"$'\n'
+      total=$((total + 1))
+    fi
+  done < <(collect_open | sort_items)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    (( shown >= limit )) && break
+    local pri id title path rest rest2 body
+    pri="${line%%|*}"
+    rest="${line#*|}"
+    id="${rest%%|*}"
+    rest2="${rest#*|}"
+    title="${rest2%%|*}"
+    path="${rest2#*|}"
+    local col
+    col="$(item_column "$id")"
+    echo "- [${id}] p${pri} (${col}) ${title}"
+    if (( details )); then
+      body="$(fm_body "$path")"
+      if [[ -n "${body// }" ]]; then
+        while IFS= read -r bline || [[ -n "$bline" ]]; do
+          echo "  ${bline}"
+        done <<< "$body"
+      fi
+      echo ""
+    fi
+    shown=$((shown + 1))
+  done <<< "$ready_lines"
+
+  if (( shown == 0 )); then
+    echo "  (none)"
+  elif (( !show_all && total > shown )); then
+    echo "  … and $((total - shown)) more (use --all)"
+  fi
+  echo ""
+}
+
+cmd_show() {
+  load_config
+  [[ $# -ge 1 ]] || die "usage: ./kai show <id>"
+  local id="$1" path note
+  path="$(require_item "$id")"
+  cat "$path"
+  note="$(status_note "$id")"
+  if [[ -n "$note" ]]; then
+    echo ""
+    echo "# status: ${note}"
+  fi
+}
+
+cmd_add() {
+  load_config
+  local author="" title="" column="" priority="0" body="" depends_csv=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --author)
+        [[ $# -ge 2 ]] || die "--author needs a value"
+        author="$2"; shift 2 ;;
+      --title)
+        [[ $# -ge 2 ]] || die "--title needs a value"
+        title="$2"; shift 2 ;;
+      --column)
+        [[ $# -ge 2 ]] || die "--column needs a value"
+        column="$2"; shift 2 ;;
+      --priority)
+        [[ $# -ge 2 ]] || die "--priority needs a value"
+        priority="$2"; shift 2 ;;
+      --body)
+        [[ $# -ge 2 ]] || die "--body needs a value"
+        body="$2"; shift 2 ;;
+      --depends)
+        [[ $# -ge 2 ]] || die "--depends needs a value"
+        depends_csv="$2"; shift 2 ;;
+      *) die "unknown add option: $1" ;;
+    esac
+  done
+  [[ -n "$author" ]] || die "add requires --author user|ai"
+  [[ -n "$title" ]] || die "add requires --title"
+  [[ -z "$column" ]] && column="$START_COLUMN"
+  valid_column "$column" || die "unknown column: $column (active: $COLUMNS)"
+  [[ "$priority" =~ ^-?[0-9]+$ ]] || die "priority must be an integer"
+
+  local letter id path created
+  letter="$(author_letter "$author")"
+  id="$(next_id "$letter")"
+  path="$(item_path "$id")"
+  created="$(date +%Y-%m-%d)"
+
+  local -a dep_arr=()
+  if [[ -n "$depends_csv" ]]; then
+    local part
+    IFS=',' read -ra _rawdeps <<< "$depends_csv"
+    for part in "${_rawdeps[@]}"; do
+      part="${part#"${part%%[![:space:]]*}"}"
+      part="${part%"${part##*[![:space:]]}"}"
+      [[ -n "$part" ]] && dep_arr+=("$part")
+    done
+    validate_depends_list "$id" "${dep_arr[@]}"
+  fi
+
+  {
+    echo "---"
+    echo "id: ${id}"
+    echo "column: ${column}"
+    echo "priority: ${priority}"
+    echo "title: ${title}"
+    echo "created: ${created}"
+    echo "author: ${author}"
+    if ((${#dep_arr[@]})); then
+      echo "depends: $(join_depends "${dep_arr[@]}")"
+    fi
+    echo "---"
+    echo ""
+    if [[ -n "$body" ]]; then
+      printf '%s\n' "$body"
+    fi
+  } > "$path"
+
+  cmd_board_write
+  echo "created ${id} → ${column}"
+}
+
+cmd_depend() {
+  load_config
+  [[ $# -ge 2 ]] || die "usage: ./kai depend <id> <dep-id>"
+  local id="$1" dep="$2" path
+  path="$(require_item "$id")"
+  item_exists "$dep" || die "depends on missing item: $dep"
+  if would_cycle "$id" "$dep"; then
+    die "dependency cycle: ${id} → ${dep}"
+  fi
+
+  local -a existing=()
+  local d
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && existing+=("$d")
+  done < <(depends_of "$id")
+  existing+=("$dep")
+  fm_set "$path" depends "$(join_depends "${existing[@]}")"
+  cmd_board_write
+  echo "depend ${id} → ${dep}"
+}
+
+cmd_undepend() {
+  load_config
+  [[ $# -ge 2 ]] || die "usage: ./kai undepend <id> <dep-id>"
+  local id="$1" dep="$2" path
+  path="$(require_item "$id")"
+  local -a kept=()
+  local d found=0
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    if [[ "$d" == "$dep" ]]; then
+      found=1
+      continue
+    fi
+    kept+=("$d")
+  done < <(depends_of "$id")
+  (( found )) || die "${id} does not depend on ${dep}"
+  if ((${#kept[@]})); then
+    fm_set "$path" depends "$(join_depends "${kept[@]}")"
+  else
+    fm_delete "$path" depends
+  fi
+  cmd_board_write
+  echo "undepend ${id} ✕ ${dep}"
+}
+
+cmd_move() {
+  load_config
+  [[ $# -ge 2 ]] || die "usage: ./kai move <id> <column>"
+  local id="$1" column="$2"
+  valid_column "$column" || die "unknown column: $column (active: $COLUMNS)"
+  local path from
+  path="$(require_item "$id")"
+  from="$(fm_get "$path" column)"
+  assert_workflow "$from" "$column"
+  assert_hard_progress "$id" "$column"
+  fm_set "$path" column "$column"
+  cmd_board_write
+  echo "moved ${id} → ${column}"
+}
+
+cmd_priority() {
+  load_config
+  [[ $# -ge 2 ]] || die "usage: ./kai priority <id> <n>"
+  local id="$1" n="$2"
+  [[ "$n" =~ ^-?[0-9]+$ ]] || die "priority must be an integer"
+  local path
+  path="$(require_item "$id")"
+  fm_set "$path" priority "$n"
+  cmd_board_write
+  echo "priority ${id} → ${n}"
+}
+
+cmd_done() {
+  load_config
+  [[ $# -ge 1 ]] || die "usage: ./kai done <id>"
+  cmd_move "$1" "$DONE_COLUMN"
+}
+
+cmd_workflow() {
+  load_config
+  echo "columns: ${COLUMNS}"
+  echo "start: ${START_COLUMN}"
+  echo "done: ${DONE_COLUMN}"
+  echo "deps_mode: ${DEPS_MODE}"
+  echo "transitions:"
+  local col tos
+  for col in "${COLUMN_ARR[@]}"; do
+    if [[ -v WORKFLOW[$col] ]]; then
+      tos="${WORKFLOW[$col]}"
+      if [[ -z "$tos" ]]; then
+        echo "  ${col} → (none)"
+      else
+        echo "  ${col} → ${tos}"
+      fi
+    else
+      echo "  ${col} → (none)"
+    fi
+  done
+}
+
+cmd_tui() {
+  local bin="" c
+  for c in "${REPO_ROOT}/kaitui/kaitui" "${REPO_ROOT}/bin/kaitui"; do
+    if [[ -x "$c" && ! -d "$c" ]]; then
+      bin="$c"
+      break
+    fi
+  done
+  # consumer install: ./kaitui file next to ./kai
+  if [[ -z "$bin" && -x "${REPO_ROOT}/kaitui" && ! -d "${REPO_ROOT}/kaitui" ]]; then
+    bin="${REPO_ROOT}/kaitui"
+  fi
+  if [[ -z "$bin" ]]; then
+    die "kaitui not found — build with: (cd kaitui && go build -o kaitui .)"
+  fi
+  exec "$bin" "$@"
+}
+
+cmd_image() {
+  load_config
+  [[ $# -ge 1 ]] || die "usage: ./kai image <path>"
+  local src="$1"
+  [[ -f "$src" ]] || die "file not found: $src"
+  local base ext
+  base="$(basename "$src")"
+  ext="${base##*.}"
+  [[ "$ext" == "$base" ]] && ext="png"
+  ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+
+  local max=0 f base num
+  shopt -s nullglob
+  for f in "${IMAGES_DIR}"/img-*.*; do
+    base="$(basename "$f")"
+    num="${base#img-}"
+    num="${num%%.*}"
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+      num=$((10#$num))
+      (( num > max )) && max=$num
+    fi
+  done
+  shopt -u nullglob
+  local next=$((max + 1))
+  local dest_name
+  dest_name="$(printf 'img-%03d.%s' "$next" "$ext")"
+  cp "$src" "${IMAGES_DIR}/${dest_name}"
+  echo ".kai/images/${dest_name}"
+}
+
+# --- main ---
+
+main() {
+  local cmd="${1:-list}"
+  shift || true
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    list) cmd_list "$@" ;;
+    ready) cmd_ready "$@" ;;
+    show) cmd_show "$@" ;;
+    add) cmd_add "$@" ;;
+    depend) cmd_depend "$@" ;;
+    undepend) cmd_undepend "$@" ;;
+    move) cmd_move "$@" ;;
+    priority) cmd_priority "$@" ;;
+    done) cmd_done "$@" ;;
+    image) cmd_image "$@" ;;
+    board) cmd_board "$@" ;;
+    workflow) cmd_workflow "$@" ;;
+    tui) cmd_tui "$@" ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $cmd (try: ./kai help)" ;;
+  esac
+}
+
+main "$@"
